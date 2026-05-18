@@ -15,3 +15,4 @@ export * from './logger';
 export * from './zod-helpers';
 export * from './prompts';
 export * from './errors';
+export * from './credentials';

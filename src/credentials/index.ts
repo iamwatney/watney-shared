@@ -1,0 +1,414 @@
+/**
+ * @watney/shared/credentials — v2 credential lifecycle library.
+ *
+ * Six public functions:
+ *   - getOrCreateCredential — anti-duplicate lookup + create-if-missing
+ *   - rotateCredential — mint new value, update SM, schedule old disable
+ *   - scheduleDeprecation — mark for delete (daily job executes after rollback)
+ *   - getCredentialValue — read SM value for a canonical name
+ *   - getCredentialMetadata — read DB row for a canonical name
+ *   - healthCheckCredential — vendor-specific probe + audit
+ *
+ * All actions write to `credential_events` for audit trail.
+ * Rate-limit: max 20 actions per vendor per day, max 50 across all vendors.
+ *
+ * Importable as:
+ *   import { getOrCreateCredential, ... } from '@watney/shared/credentials';
+ */
+import { createLogger } from '../logger';
+import { ConfigError } from '../errors';
+import { buildCanonicalName, parseCanonicalName, isCanonicalConforming, registerScope, registerVendor } from './canonical-name';
+import { createSmClient, type SmClient } from './secret-manager';
+import { createRegistry, type CredentialRegistry } from './registry';
+import { getVendorAdapter, listSupportedVendors } from './vendors';
+import {
+  CanonicalNameError,
+  DuplicateCredentialError,
+  RateLimitExceededError,
+  VendorBlockedError,
+  type CanonicalKey,
+  type CredentialAction,
+  type CredentialRow,
+  type Env,
+  type HealthCheckResult,
+  type Scope,
+  type Vendor,
+} from './types';
+
+export {
+  CanonicalNameError,
+  DuplicateCredentialError,
+  RateLimitExceededError,
+  VendorBlockedError,
+  buildCanonicalName,
+  parseCanonicalName,
+  isCanonicalConforming,
+  registerScope,
+  registerVendor,
+  createSmClient,
+  createRegistry,
+  getVendorAdapter,
+  listSupportedVendors,
+};
+export type {
+  CanonicalKey,
+  CredentialAction,
+  CredentialRow,
+  Env,
+  HealthCheckResult,
+  Scope,
+  Vendor,
+  SmClient,
+  CredentialRegistry,
+};
+
+const log = createLogger('watney-shared.credentials');
+
+// ─── Module-level singletons (lazy) ────────────────────────────────────────
+// Callers can override by passing explicit { sm, registry } per call.
+
+let _sm: SmClient | null = null;
+let _registry: CredentialRegistry | null = null;
+
+function sm(): SmClient { return _sm ?? (_sm = createSmClient()); }
+function registry(): CredentialRegistry { return _registry ?? (_registry = createRegistry()); }
+
+/** Reset singletons — for tests. */
+export function _resetForTests(opts: { sm?: SmClient; registry?: CredentialRegistry } = {}): void {
+  _sm = opts.sm ?? null;
+  _registry = opts.registry ?? null;
+}
+
+// ─── Rate limits ───────────────────────────────────────────────────────────
+
+const DEFAULT_VENDOR_LIMIT = parseInt(process.env.WATNEY_CRED_VENDOR_RATE_LIMIT ?? '20', 10);
+const DEFAULT_GLOBAL_LIMIT = parseInt(process.env.WATNEY_CRED_GLOBAL_RATE_LIMIT ?? '50', 10);
+
+async function checkRateLimit(vendor: Vendor, action: CredentialAction): Promise<void> {
+  // Skip rate-limit for read-only ops
+  if (action === 'lookup-existing' || action === 'health-check-fail') return;
+  const reg = registry();
+  const globalCount = await reg.countAutonomousActionsToday();
+  if (globalCount >= DEFAULT_GLOBAL_LIMIT) {
+    throw new RateLimitExceededError('GLOBAL', globalCount, DEFAULT_GLOBAL_LIMIT);
+  }
+  const vendorCount = await reg.countAutonomousActionsToday({
+    actor: `credential-steward-daily-${vendor.toLowerCase()}`,
+  });
+  if (vendorCount >= DEFAULT_VENDOR_LIMIT) {
+    throw new RateLimitExceededError(vendor, vendorCount, DEFAULT_VENDOR_LIMIT);
+  }
+}
+
+// ─── Public API ────────────────────────────────────────────────────────────
+
+export interface GetOrCreateOpts extends CanonicalKey {
+  requester: string;
+  context?: string;
+  /** Override the auto-formatted canonical name (rare — naming-convention bypass). */
+  overrideName?: string;
+  /** If true and vendor adapter blocks creation, escalate to Paul rather than throw. */
+  escalateOnBlock?: boolean;
+}
+
+export interface GetOrCreateResult {
+  smName: string;
+  smVersion: number;
+  created: boolean;
+  canonicalName: string;
+  dbId: string;
+}
+
+/**
+ * Returns existing credential or creates a new one. Idempotent via
+ * canonical-key anti-duplicate check.
+ */
+export async function getOrCreateCredential(opts: GetOrCreateOpts): Promise<GetOrCreateResult> {
+  const canonicalName = opts.overrideName ?? buildCanonicalName({
+    scope: opts.scope, vendor: opts.vendor, purpose: opts.purpose, env: opts.env ?? null,
+  });
+
+  // Step 1: anti-duplicate check by canonical key (and by name)
+  const reg = registry();
+  const existing = await reg.findByCanonicalKey({
+    scope: opts.scope, vendor: opts.vendor, purpose: opts.purpose, env: opts.env ?? null,
+  });
+  if (existing) {
+    log.info({ canonicalName, dbId: existing.id, requester: opts.requester }, 'returning existing credential');
+    await reg.insertEvent({
+      credential_id: existing.id,
+      credential_name: canonicalName,
+      event_type: 'health-check',
+      result: 'noop',
+      actor: opts.requester,
+      details: { kind: 'lookup-existing', canonical: canonicalName },
+    });
+    const version = await sm().latestVersion(existing.name);
+    return {
+      smName: existing.name,
+      smVersion: version,
+      created: false,
+      canonicalName: existing.canonical_name ?? existing.name,
+      dbId: existing.id,
+    };
+  }
+
+  // Step 2: vendor adapter lookup
+  const adapter = getVendorAdapter(opts.vendor);
+  if (!adapter) {
+    throw new ConfigError(opts.vendor, `no vendor adapter — supported: ${listSupportedVendors().join(',')}`);
+  }
+  if (!adapter.createSupported) {
+    if (opts.escalateOnBlock) {
+      log.warn({ canonicalName, vendor: opts.vendor, requester: opts.requester }, 'vendor create blocked — escalating');
+      await reg.insertEvent({
+        credential_name: canonicalName,
+        event_type: 'review-required',
+        result: 'pending',
+        actor: opts.requester,
+        details: { kind: 'escalate-to-paul', vendor: opts.vendor, purpose: opts.purpose, hint: adapter.notes ?? '' },
+      });
+      throw new VendorBlockedError(opts.vendor, 'create', adapter.notes ?? 'create not supported');
+    }
+    throw new VendorBlockedError(opts.vendor, 'create', adapter.notes ?? 'create not supported');
+  }
+
+  // Step 3: rate-limit check
+  await checkRateLimit(opts.vendor, 'create');
+
+  // Step 4: mint value at vendor
+  log.info({ canonicalName, vendor: opts.vendor, requester: opts.requester }, 'minting new credential');
+  const { value, vendorMetadata } = await adapter.createCredential({
+    canonicalName,
+    purpose: opts.purpose,
+    scope: opts.scope,
+    env: opts.env,
+    context: opts.context,
+  });
+
+  // Step 5: store in SM
+  let smCreateResult: { resourceName: string; version: number };
+  if (await sm().exists(canonicalName)) {
+    const v = await sm().addVersion(canonicalName, value);
+    smCreateResult = { resourceName: `projects/<project>/secrets/${canonicalName}`, version: v.version };
+  } else {
+    smCreateResult = await sm().create(canonicalName, value, {
+      labels: {
+        scope: opts.scope.toLowerCase(),
+        vendor: opts.vendor.toLowerCase(),
+        purpose: opts.purpose.toLowerCase().replace(/[^a-z0-9_-]/g, ''),
+        created_by: 'credential-steward-v2',
+      },
+    });
+  }
+
+  // Step 6: insert DB row
+  const inserted = await reg.insert({
+    name: canonicalName,
+    canonical_name: canonicalName,
+    vendor: opts.vendor.toLowerCase(),
+    credential_type: inferCredentialType(opts.vendor, opts.purpose),
+    scope: opts.scope === 'WATNEY' || opts.scope === 'EDGE_AI' ? 'account-wide' : 'project-scoped',
+    scope_target: opts.scope === 'WATNEY' || opts.scope === 'EDGE_AI' ? null : opts.scope,
+    source_of_truth: 'gcp-secret-manager',
+    source_location: `${process.env.GCP_PROJECT ?? 'watney-workflows'}/${canonicalName}`,
+    privilege_scope: 'write',
+    description: `Created by credential-steward v2 at ${new Date().toISOString()} for ${opts.requester}${opts.context ? ` — ${opts.context}` : ''}`,
+    notes: `Vendor metadata: ${JSON.stringify(vendorMetadata)}`,
+    owner: 'paul',
+    confidence: 'HIGH',
+    needs_review: false,
+    created_by: opts.requester,
+    purpose: opts.purpose,
+    env: opts.env ?? null,
+    rollback_days: 7,
+    vendor_api_supports_create: adapter.createSupported,
+    vendor_api_supports_rotation: adapter.rotateSupported,
+    vendor_api_supports_delete: adapter.deleteSupported,
+    tags: { products: [], purposes: [opts.purpose.toLowerCase()] },
+  });
+
+  // Step 7: audit event
+  await reg.insertEvent({
+    credential_id: inserted.id,
+    credential_name: canonicalName,
+    event_type: 'created',
+    result: 'succeeded',
+    actor: opts.requester,
+    details: {
+      kind: 'create',
+      vendor: opts.vendor,
+      purpose: opts.purpose,
+      scope: opts.scope,
+      env: opts.env,
+      sm_version: smCreateResult.version,
+      vendor_metadata: vendorMetadata,
+    },
+  });
+
+  log.info({ canonicalName, dbId: inserted.id, smVersion: smCreateResult.version }, 'credential created');
+  return {
+    smName: canonicalName,
+    smVersion: smCreateResult.version,
+    created: true,
+    canonicalName,
+    dbId: inserted.id,
+  };
+}
+
+export interface RotateOpts {
+  canonicalName: string;
+  requester: string;
+  reason: string;
+}
+
+export interface RotateResult {
+  newSmVersion: number;
+  oldSmVersion: number;
+  rollbackUntil: Date;
+}
+
+export async function rotateCredential(opts: RotateOpts): Promise<RotateResult> {
+  const reg = registry();
+  const row = await reg.findByName(opts.canonicalName);
+  if (!row) throw new ConfigError(opts.canonicalName, 'credential not found in registry');
+  const adapter = getVendorAdapter(row.vendor.toUpperCase());
+  if (!adapter) throw new ConfigError(row.vendor, 'no vendor adapter');
+  if (!adapter.rotateSupported) {
+    throw new VendorBlockedError(row.vendor, 'rotate', adapter.notes ?? 'rotate not supported');
+  }
+  await checkRateLimit(row.vendor.toUpperCase(), 'rotate');
+
+  const oldVersion = await sm().latestVersion(row.name);
+
+  // Extract vendor metadata from notes field (set at create time)
+  let currentVendorMetadata: Record<string, unknown> = {};
+  try {
+    const match = (row.notes ?? '').match(/Vendor metadata: (\{.+\})/);
+    if (match) currentVendorMetadata = JSON.parse(match[1]) as Record<string, unknown>;
+  } catch { /* ignore */ }
+
+  const { value, vendorMetadata } = await adapter.rotateCredential({
+    canonicalName: row.name,
+    currentVendorMetadata,
+  });
+
+  const newVersion = (await sm().addVersion(row.name, value)).version;
+  const rollbackDays = row.rollback_days ?? 7;
+  const rollbackUntil = new Date(Date.now() + rollbackDays * 24 * 60 * 60 * 1000);
+
+  await reg.update(row.id, {
+    last_verified_at: new Date().toISOString(),
+    last_verified_status: 'alive',
+    last_verified_by: opts.requester,
+    superseded_at: new Date().toISOString(),
+    superseded_by_canonical_name: row.canonical_name ?? row.name,
+    notes: `${row.notes ?? ''} | Rotated ${new Date().toISOString()} by ${opts.requester} — new vendor metadata: ${JSON.stringify(vendorMetadata)}`,
+  });
+
+  await reg.insertEvent({
+    credential_id: row.id,
+    credential_name: row.name,
+    event_type: 'rotated',
+    result: 'succeeded',
+    actor: opts.requester,
+    details: {
+      kind: 'rotate',
+      reason: opts.reason,
+      old_sm_version: oldVersion,
+      new_sm_version: newVersion,
+      rollback_until: rollbackUntil.toISOString(),
+      vendor_metadata: vendorMetadata,
+    },
+  });
+
+  return { newSmVersion: newVersion, oldSmVersion: oldVersion, rollbackUntil };
+}
+
+export interface ScheduleDeprecationOpts {
+  canonicalName: string;
+  reason: string;
+  requester?: string;
+}
+
+export interface ScheduleDeprecationResult {
+  scheduledDeleteAt: Date;
+}
+
+export async function scheduleDeprecation(opts: ScheduleDeprecationOpts): Promise<ScheduleDeprecationResult> {
+  const reg = registry();
+  const row = await reg.findByName(opts.canonicalName);
+  if (!row) throw new ConfigError(opts.canonicalName, 'credential not found in registry');
+  const rollbackDays = row.rollback_days ?? 7;
+  const scheduledDeleteAt = new Date(Date.now() + rollbackDays * 24 * 60 * 60 * 1000);
+  await reg.update(row.id, {
+    pending_deprecation_at: scheduledDeleteAt.toISOString(),
+    notes: `${row.notes ?? ''} | Scheduled deprecation by ${opts.requester ?? 'unknown'} at ${new Date().toISOString()} — reason: ${opts.reason}`,
+  });
+  await reg.insertEvent({
+    credential_id: row.id,
+    credential_name: row.name,
+    event_type: 'flagged',
+    result: 'pending',
+    actor: opts.requester ?? 'credential-steward-v2',
+    details: { kind: 'deprecate-scheduled', reason: opts.reason, scheduled_delete_at: scheduledDeleteAt.toISOString() },
+  });
+  return { scheduledDeleteAt };
+}
+
+export async function getCredentialValue(canonicalName: string): Promise<string> {
+  return sm().read(canonicalName);
+}
+
+export async function getCredentialMetadata(canonicalName: string): Promise<CredentialRow | null> {
+  return registry().findByName(canonicalName);
+}
+
+export async function healthCheckCredential(canonicalName: string): Promise<HealthCheckResult> {
+  const reg = registry();
+  const row = await reg.findByName(canonicalName);
+  if (!row) {
+    return { healthy: false, lastChecked: new Date(), failureReason: 'not in registry' };
+  }
+  const adapter = getVendorAdapter(row.vendor.toUpperCase());
+  if (!adapter) {
+    return { healthy: false, lastChecked: new Date(), failureReason: `no adapter for vendor ${row.vendor}` };
+  }
+  const value = await sm().read(row.name);
+  try {
+    const result = await adapter.healthCheck({ canonicalName: row.name, value });
+    await reg.insertEvent({
+      credential_id: row.id,
+      credential_name: row.name,
+      event_type: 'health-check',
+      result: result.healthy ? 'alive' : 'dead',
+      actor: 'credential-steward-v2:healthCheck',
+      details: {
+        kind: 'health-check',
+        healthy: result.healthy,
+        failure_reason: result.failureReason ?? null,
+      },
+    });
+    return result;
+  } catch (err) {
+    return { healthy: false, lastChecked: new Date(), failureReason: (err as Error).message };
+  }
+}
+
+// ─── Helpers ───────────────────────────────────────────────────────────────
+
+function inferCredentialType(vendor: Vendor, purpose: string): string {
+  const v = vendor.toUpperCase();
+  const p = purpose.toUpperCase();
+  if (/WEBHOOK/.test(p)) return 'webhook_secret';
+  if (/OAUTH/.test(p)) return p.includes('CLIENT') ? 'oauth_client_id' : 'oauth_refresh';
+  if (/PAT/.test(p)) return 'pat';
+  if (/SERVICE_ROLE/.test(p)) return 'service_role_jwt';
+  if (/ANON/.test(p)) return 'anon_jwt';
+  if (/APP_PASSWORD/.test(p)) return 'app_password';
+  if (/SA_KEY/.test(p) || v === 'GCP') return 'sa_key';
+  if (/MGMT/.test(p) || /MANAGEMENT/.test(p)) return 'management_api';
+  if (/CONFIG_URL/.test(p)) return 'config_url';
+  if (/CONFIG_VAL/.test(p)) return 'config_value';
+  return 'api_key';
+}

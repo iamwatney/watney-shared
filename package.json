@@ -1,7 +1,7 @@
 {
   "name": "@watney/shared",
-  "version": "1.1.0",
-  "description": "Shared runtime utilities for the Watney service estate (Supabase, LLM usage logger, pino logger, zod helpers, anti-injection prompts, typed errors).",
+  "version": "1.2.0",
+  "description": "Shared runtime utilities for the Watney service estate (Supabase, LLM usage logger, pino logger, zod helpers, anti-injection prompts, typed errors, credential lifecycle).",
   "license": "UNLICENSED",
   "private": true,
   "type": "commonjs",
@@ -39,6 +39,10 @@
     "./errors": {
       "types": "./dist/errors/index.d.ts",
       "default": "./dist/errors/index.js"
+    },
+    "./credentials": {
+      "types": "./dist/credentials/index.d.ts",
+      "default": "./dist/credentials/index.js"
     }
   },
   "scripts": {
