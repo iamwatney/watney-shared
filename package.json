@@ -1,6 +1,6 @@
 {
   "name": "@watney/shared",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Shared runtime utilities for the Watney service estate (Supabase, LLM usage logger, pino logger, zod helpers, anti-injection prompts, typed errors).",
   "license": "UNLICENSED",
   "private": true,
@@ -50,7 +50,7 @@
   "dependencies": {
     "@supabase/supabase-js": "^2.100.0",
     "pino": "^9.5.0",
-    "zod": "^3.23.0"
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^22.15.3",
