@@ -1,0 +1,14 @@
+C:/Users/paulj/OneDrive/Documents/claude/Projects/credential-steward-daily
+C:/Users/paulj/OneDrive/Documents/claude/Projects/edge-agentic-stage7-reconciliation
+C:/Users/paulj/OneDrive/Documents/claude/Projects/edge-ai-email-sender
+C:/Users/paulj/OneDrive/Documents/claude/Projects/edge-ai-news-refresh
+C:/Users/paulj/OneDrive/Documents/claude/Projects/edge-ai-proposal-agent
+C:/Users/paulj/OneDrive/Documents/claude/Projects/edge-ai-scoping-email-sender
+C:/Users/paulj/OneDrive/Documents/claude/Projects/edge-ai-scoping-processor
+C:/Users/paulj/OneDrive/Documents/claude/Projects/edge-ai-spend-monitor
+C:/Users/paulj/OneDrive/Documents/claude/Projects/edge-ai
+C:/Users/paulj/OneDrive/Documents/claude/Projects/edge-ai/cockpit-build-recorder
+C:/Users/paulj/OneDrive/Documents/claude/Projects/edge-ai/cockpit-email-digest
+C:/Users/paulj/OneDrive/Documents/claude/Projects/edge-ai/cockpit-push-dispatcher
+C:/Users/paulj/OneDrive/Documents/claude/Projects/edge-ai/cockpit-stripe-webhook
+C:/Users/paulj/OneDrive/Documents/claude/Projects/credentials-and-context-cleanup/cloud-run-event-handler
