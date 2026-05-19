@@ -16,3 +16,4 @@ export * from './zod-helpers';
 export * from './prompts';
 export * from './errors';
 export * from './credentials';
+export * from './smoke-test';

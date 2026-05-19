@@ -14,6 +14,7 @@ Shared runtime utilities for the Watney service estate. Installed in every Cloud
 - **`@watney/shared/zod-helpers`** — common schemas (`uuidSchema`, `isoDateSchema`, `clientIdSchema`, `projectIdSchema`, `emailSchema`, `gbpAmountSchema`, etc) for input validation at API route + job boundaries. M10. Re-exports `z` from zod.
 - **`@watney/shared/prompts`** — `ANTI_INJECTION_PREAMBLE` constant. Source of truth for the M5 anti-injection preamble that watney-crew agents include in their system prompts.
 - **`@watney/shared/errors`** — typed error classes (`ValidationError`, `UpstreamError`, `ConfigError`) and `formatForGcp(err)` for structured pino logging.
+- **`@watney/shared/smoke-test`** — `runSmokeTest()`, `publishDeployAlert()`, `runPostDeploy()` for post-deploy healthcheck + alerting. CLI binary `watney-smoke-test` invoked by deploy scripts after `gcloud run deploy`. Alert-only (no auto-rollback, no auto-pause). Inserts into `public.deploy_alerts` on failure and emails `pauljfuggle@hotmail.com` via Gmail SMTP. M8.
 
 ## Usage
 

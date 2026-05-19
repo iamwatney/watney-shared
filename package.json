@@ -1,6 +1,6 @@
 {
   "name": "@watney/shared",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Shared runtime utilities for the Watney service estate (Supabase, LLM usage logger, pino logger, zod helpers, anti-injection prompts, typed errors, credential lifecycle).",
   "license": "UNLICENSED",
   "private": true,
@@ -43,7 +43,15 @@
     "./credentials": {
       "types": "./dist/credentials/index.d.ts",
       "default": "./dist/credentials/index.js"
-    }
+    },
+    "./smoke-test": {
+      "types": "./dist/smoke-test/index.d.ts",
+      "default": "./dist/smoke-test/index.js"
+    },
+    "./bin/smoke-test": "./dist/bin/smoke-test.js"
+  },
+  "bin": {
+    "watney-smoke-test": "./dist/bin/smoke-test.js"
   },
   "scripts": {
     "build": "tsc",
@@ -55,6 +63,14 @@
     "@supabase/supabase-js": "^2.100.0",
     "pino": "^9.5.0",
     "zod": "^4.4.3"
+  },
+  "peerDependencies": {
+    "nodemailer": "^6.9.0"
+  },
+  "peerDependenciesMeta": {
+    "nodemailer": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/node": "^22.15.3",
