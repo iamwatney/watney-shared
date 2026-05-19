@@ -1,0 +1,172 @@
+name: Headless Crew CI Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main, master]
+
+# All gate logic runs in one job so the status check is single-pivoted.
+jobs:
+  gate:
+    name: gate
+    # Run on every PR. The script + step level "if:" gates handle skipping
+    # families that don't apply (no migrations, no package.json, etc).
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    timeout-minutes: 15
+
+    steps:
+      - name: Check override
+        id: override
+        run: |
+          BODY="${{ github.event.pull_request.body }}"
+          if echo "$BODY" | grep -qE '^override-ci-gate:'; then
+            REASON=$(echo "$BODY" | grep -E '^override-ci-gate:' | head -1 | sed 's/^override-ci-gate:[[:space:]]*//')
+            echo "::warning::CI gate OVERRIDDEN — reason: $REASON"
+            echo "overridden=true" >> $GITHUB_OUTPUT
+          else
+            echo "overridden=false" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.override.outputs.overridden != 'true'
+        with:
+          fetch-depth: 0  # qc-rls-gate diff inspection needs full history
+
+      - name: Detect changed paths
+        if: steps.override.outputs.overridden != 'true'
+        id: changes
+        run: |
+          BASE=$(git rev-parse origin/${{ github.event.pull_request.base.ref }})
+          HEAD=$(git rev-parse HEAD)
+          CHANGED=$(git diff --name-only "$BASE" "$HEAD")
+          echo "$CHANGED"
+          echo "has_migrations=$(echo "$CHANGED" | grep -E '^supabase/migrations/.*\.sql$' | head -1 | wc -l)" >> $GITHUB_OUTPUT
+          echo "has_package_json=$([ -f package.json ] && echo 1 || echo 0)" >> $GITHUB_OUTPUT
+
+      - uses: actions/setup-node@v4
+        if: steps.override.outputs.overridden != 'true' && steps.changes.outputs.has_package_json == '1'
+        with:
+          node-version: '22'
+
+      - name: Detect package manager
+        if: steps.override.outputs.overridden != 'true' && steps.changes.outputs.has_package_json == '1'
+        id: pm
+        run: |
+          if [ -f pnpm-lock.yaml ]; then echo "pm=pnpm" >> $GITHUB_OUTPUT
+          elif [ -f yarn.lock ]; then echo "pm=yarn" >> $GITHUB_OUTPUT
+          else echo "pm=npm" >> $GITHUB_OUTPUT; fi
+
+      - name: Install pnpm
+        if: steps.override.outputs.overridden != 'true' && steps.pm.outputs.pm == 'pnpm'
+        run: npm install -g pnpm@9
+
+      - name: Install deps
+        if: steps.override.outputs.overridden != 'true' && steps.changes.outputs.has_package_json == '1'
+        run: |
+          case "${{ steps.pm.outputs.pm }}" in
+            pnpm) pnpm install --frozen-lockfile ;;
+            yarn) yarn install --frozen-lockfile ;;
+            npm)  npm ci ;;
+          esac
+
+      - name: Lint
+        if: steps.override.outputs.overridden != 'true' && steps.changes.outputs.has_package_json == '1'
+        run: |
+          if node -e "process.exit(require('./package.json').scripts?.lint?0:1)"; then
+            ${{ steps.pm.outputs.pm }} run lint
+          else
+            echo "::notice::No 'lint' script — skipping"
+          fi
+
+      - name: Typecheck
+        if: steps.override.outputs.overridden != 'true' && steps.changes.outputs.has_package_json == '1'
+        run: |
+          if node -e "process.exit(require('./package.json').scripts?.typecheck?0:1)"; then
+            ${{ steps.pm.outputs.pm }} run typecheck
+          else
+            echo "::notice::No 'typecheck' script — skipping"
+          fi
+
+      - name: Test
+        if: steps.override.outputs.overridden != 'true' && steps.changes.outputs.has_package_json == '1'
+        run: |
+          if node -e "process.exit(require('./package.json').scripts?.test?0:1)"; then
+            ${{ steps.pm.outputs.pm }} test
+          else
+            echo "::notice::No 'test' script — skipping"
+          fi
+
+      - name: Build
+        if: steps.override.outputs.overridden != 'true' && steps.changes.outputs.has_package_json == '1'
+        run: |
+          if node -e "process.exit(require('./package.json').scripts?.build?0:1)"; then
+            ${{ steps.pm.outputs.pm }} run build
+          else
+            echo "::notice::No 'build' script — skipping"
+          fi
+
+      - name: Gitleaks scan (C9)
+        if: steps.override.outputs.overridden != 'true'
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # No GITLEAKS_LICENSE: we run the free OSS version. Repo is private
+        # but iamwatney is an individual user; gitleaks action still works
+        # in OSS mode, it just suppresses the SARIF upload.
+        continue-on-error: false
+
+      - name: QC RLS gate (C4 — file mode)
+        if: steps.override.outputs.overridden != 'true' && steps.changes.outputs.has_migrations == '1'
+        run: |
+          if [ -f .github/scripts/qc-rls-gate-file.js ]; then
+            node .github/scripts/qc-rls-gate-file.js --migration-dir=supabase/migrations
+          else
+            echo "::error::Migrations changed but .github/scripts/qc-rls-gate-file.js missing — re-run install.sh from watney-shared/ci-gates/"
+            exit 1
+          fi
+
+      - name: QC shared-lib gate (M1 — CI mode)
+        if: steps.override.outputs.overridden != 'true' && steps.changes.outputs.has_package_json == '1'
+        run: |
+          if [ -f .github/scripts/qc-shared-lib-gate-ci.js ]; then
+            # Run from each leaf service dir if monorepo, else just the root
+            if [ -f pnpm-workspace.yaml ]; then
+              # pnpm monorepo — collect leaf service dirs
+              SERVICES=$(node -e "const fs=require('fs'),p=require('path'); function walk(d){let out=[]; for(const e of fs.readdirSync(d,{withFileTypes:true})){if(!e.isDirectory()) continue; if(['node_modules','dist','.git','.next','build'].includes(e.name)) continue; const sub=p.join(d,e.name); if(fs.existsSync(p.join(sub,'package.json'))){out.push(sub); continue;} out.push(...walk(sub));} return out;} for(const s of walk('src')) console.log(s);")
+              echo "$SERVICES" | while read SVC; do
+                if [ -n "$SVC" ]; then
+                  echo "::group::shared-lib gate: $SVC"
+                  node .github/scripts/qc-shared-lib-gate-ci.js --service-dir="$SVC"
+                  echo "::endgroup::"
+                fi
+              done
+            else
+              node .github/scripts/qc-shared-lib-gate-ci.js --service-dir=.
+            fi
+          else
+            echo "::notice::No qc-shared-lib-gate-ci.js — skipping"
+          fi
+
+      - name: Gate summary
+        if: always()
+        run: |
+          if [ "${{ steps.override.outputs.overridden }}" = "true" ]; then
+            echo "## CI Gate: OVERRIDDEN" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "PR body contained 'override-ci-gate:' — gate skipped." >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ job.status }}" = "success" ]; then
+            echo "## CI Gate: PASS" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "- lint, typecheck, test, build, gitleaks all pass" >> $GITHUB_STEP_SUMMARY
+            echo "- migrations: $(if [ '${{ steps.changes.outputs.has_migrations }}' = '1' ]; then echo 'RLS gate ran + passed'; else echo 'no changes — gate skipped'; fi)" >> $GITHUB_STEP_SUMMARY
+            echo "- shared-lib gate: $(if [ '${{ steps.changes.outputs.has_package_json }}' = '1' ]; then echo 'ran + passed'; else echo 'no package.json — gate skipped'; fi)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## CI Gate: FAIL" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "One or more checks failed. The scheduler poll will pick this PR up and trigger Phase A remediation (Bug Fix Developer)." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "After 3 attempts, the PR is labelled \`ci-remediation-exhausted\` and escalated to Paul." >> $GITHUB_STEP_SUMMARY
+          fi
