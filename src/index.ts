@@ -11,6 +11,7 @@
  */
 export * from './supabase';
 export * from './llm-usage';
+export * from './outcomes';
 export * from './logger';
 export * from './zod-helpers';
 export * from './prompts';

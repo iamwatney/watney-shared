@@ -54,6 +54,14 @@ export interface LlmUsageEvent {
   clientId?: string | null;
   sessionId?: string | null;
   apiKeyName?: string | null;
+  // ─── NEW in v1.4.0 (telemetry-foundation) — all optional, default null ──
+  // See Projects/telemetry-foundation/design-docs/2026-05-27-shared-lib-v1.2.0-design.md
+  // and migration 021_telemetry_foundation.sql. Backwards-compatible by
+  // construction: omit them and the row inserts with NULL.
+  decisionId?: string | null;
+  agentName?: string | null;
+  promptVersion?: string | null;
+  outcomeId?: string | null;
 }
 
 export interface LogLlmUsageOpts {
@@ -80,6 +88,11 @@ export function logLlmUsage(evt: LlmUsageEvent, opts: LogLlmUsageOpts = {}): Pro
     client_id:          evt.clientId ?? null,
     session_id:         evt.sessionId ?? null,
     api_key_name:       evt.apiKeyName ?? null,
+    // ─── NEW in v1.4.0 — coerced to null when undefined ────────────────
+    decision_id:        evt.decisionId ?? null,
+    agent_name:         evt.agentName ?? null,
+    prompt_version:     evt.promptVersion ?? null,
+    outcome_id:         evt.outcomeId ?? null,
   };
 
   // SDK path
