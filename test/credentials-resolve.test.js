@@ -204,3 +204,28 @@ test('registerExistingSecret: inserts metadata-only row, needs_review, no mint; 
   assert.equal(r2.registered, false);
   cred._resetForTests();
 });
+
+// ─── F5 finalizeDeprecation (convergence + idempotency) ───────────────────────
+
+test('finalizeDeprecation: converges DB (deprecated_at, clears pending) and is idempotent', async () => {
+  const reg = fakeRegistry([{
+    id: 'c1', name: 'WATNEY_VERCEL_OLD', canonical_name: 'WATNEY_VERCEL_OLD', vendor: 'vercel',
+    source_of_truth: 'gcp-secret-manager', source_location: 'watney-workflows/WATNEY_VERCEL_OLD',
+    last_verified_status: 'alive', pending_deprecation_at: '2026-07-01T00:00:00Z', deprecated_at: null,
+  }]);
+  cred._resetForTests({ registry: reg });
+
+  const res = await cred.finalizeDeprecation({ canonicalName: 'WATNEY_VERCEL_OLD', requester: 'test', vendorDeleted: true });
+  assert.equal(res.alreadyDeprecated, false);
+  const rowNow = reg.rows.find((x) => x.id === 'c1');
+  assert.ok(rowNow.deprecated_at, 'deprecated_at set');
+  assert.equal(rowNow.last_verified_status, 'deprecated');
+  assert.equal(rowNow.pending_deprecation_at, null, 'pending cleared → stops daily re-delete');
+  assert.ok(reg.events.some((e) => e.event_type === 'deprecated'), 'deprecated event written');
+
+  // Idempotent: second call is a no-op, no duplicate event.
+  const res2 = await cred.finalizeDeprecation({ canonicalName: 'WATNEY_VERCEL_OLD' });
+  assert.equal(res2.alreadyDeprecated, true);
+  assert.equal(reg.events.filter((e) => e.event_type === 'deprecated').length, 1);
+  cred._resetForTests();
+});

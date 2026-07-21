@@ -123,7 +123,10 @@ export function createRegistry(opts: RegistryOpts = {}): CredentialRegistry {
       const sinceIso = new Date(new Date().setUTCHours(0, 0, 0, 0)).toISOString();
       const filters: string[] = [
         `occurred_at=gte.${encodeURIComponent(sinceIso)}`,
-        `event_type=in.(created,rotated,deprecated,flagged)`,
+        // Count only true autonomous MUTATIONS (M2). `flagged` events (drift +
+        // scheduled-deprecation markers) were inflating the count and could
+        // starve the daily cap on a drift-heavy day.
+        `event_type=in.(created,rotated,deprecated)`,
       ];
       if (opts.actor) filters.push(`actor=eq.${encodeURIComponent(opts.actor)}`);
       else filters.push(`actor=like.*steward*`);

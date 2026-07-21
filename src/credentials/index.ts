@@ -248,6 +248,7 @@ export async function getOrCreateCredential(opts: GetOrCreateOpts): Promise<GetO
     source_location: `${process.env.GCP_PROJECT ?? 'watney-workflows'}/${canonicalName}`,
     privilege_scope: 'write',
     description: `Created by credential-steward v2 at ${new Date().toISOString()} for ${opts.requester}${opts.context ? ` — ${opts.context}` : ''}`,
+    vendor_metadata: vendorMetadata,
     notes: `Vendor metadata: ${JSON.stringify(vendorMetadata)}`,
     owner: 'paul',
     confidence: 'HIGH',
@@ -315,12 +316,10 @@ export async function rotateCredential(opts: RotateOpts): Promise<RotateResult> 
 
   const oldVersion = await sm().latestVersion(row.name);
 
-  // Extract vendor metadata from notes field (set at create time)
-  let currentVendorMetadata: Record<string, unknown> = {};
-  try {
-    const match = (row.notes ?? '').match(/Vendor metadata: (\{.+\})/);
-    if (match) currentVendorMetadata = JSON.parse(match[1]) as Record<string, unknown>;
-  } catch { /* ignore */ }
+  // Structured vendor metadata (F5) — column first, legacy notes fallback. The
+  // old metadata is preserved as superseded_vendor_metadata so deprecation
+  // revokes the OLD key, not the freshly-rotated one.
+  const currentVendorMetadata = readVendorMetadata(row);
 
   const { value, vendorMetadata } = await adapter.rotateCredential({
     canonicalName: row.name,
@@ -337,7 +336,9 @@ export async function rotateCredential(opts: RotateOpts): Promise<RotateResult> 
     last_verified_by: opts.requester,
     superseded_at: new Date().toISOString(),
     superseded_by_canonical_name: row.canonical_name ?? row.name,
-    notes: `${row.notes ?? ''} | Rotated ${new Date().toISOString()} by ${opts.requester} — new vendor metadata: ${JSON.stringify(vendorMetadata)}`,
+    vendor_metadata: vendorMetadata,                     // new key (F5 — structured, authoritative)
+    superseded_vendor_metadata: currentVendorMetadata,   // old key → correct revoke target
+    notes: `${row.notes ?? ''} | Rotated ${new Date().toISOString()} by ${opts.requester}`,
   });
 
   await reg.insertEvent({
@@ -388,6 +389,55 @@ export async function scheduleDeprecation(opts: ScheduleDeprecationOpts): Promis
     details: { kind: 'deprecate-scheduled', reason: opts.reason, scheduled_delete_at: scheduledDeleteAt.toISOString() },
   });
   return { scheduledDeleteAt };
+}
+
+export interface FinalizeDeprecationOpts {
+  canonicalName: string;
+  requester?: string;
+  /** The vendor-side delete outcome, recorded in the audit event. */
+  vendorDeleted?: boolean;
+}
+
+export interface FinalizeDeprecationResult {
+  deprecatedAt: Date;
+  alreadyDeprecated: boolean;
+}
+
+/**
+ * Converge a credential to 'deprecated' AFTER its vendor key has been revoked
+ * (audit F5). Sets `deprecated_at` + `last_verified_status='deprecated'` and
+ * clears `pending_deprecation_at` so the daily job stops re-attempting the
+ * delete every run (the old code deleted at the vendor but never converged the
+ * DB → 404-loop + "auto-deprecated" re-reported daily). Writes a 'deprecated'
+ * audit event. Idempotent: no-op if already deprecated.
+ */
+export async function finalizeDeprecation(opts: FinalizeDeprecationOpts): Promise<FinalizeDeprecationResult> {
+  const reg = registry();
+  const row = await reg.findByName(opts.canonicalName);
+  if (!row) throw new ConfigError(opts.canonicalName, 'credential not found in registry');
+  if (row.deprecated_at) {
+    return { deprecatedAt: new Date(row.deprecated_at), alreadyDeprecated: true };
+  }
+  const deprecatedAt = new Date();
+  await reg.update(row.id, {
+    deprecated_at: deprecatedAt.toISOString(),
+    last_verified_status: 'deprecated',
+    last_verified_at: deprecatedAt.toISOString(),
+    pending_deprecation_at: null, // stop the daily re-delete loop
+  });
+  await reg.insertEvent({
+    credential_id: row.id,
+    credential_name: row.name,
+    event_type: 'deprecated',
+    result: 'succeeded',
+    actor: opts.requester ?? 'credential-steward-v2:finalizeDeprecation',
+    details: {
+      kind: 'deprecate-finalized',
+      vendor_deleted: opts.vendorDeleted ?? null,
+      deprecated_at: deprecatedAt.toISOString(),
+    },
+  });
+  return { deprecatedAt, alreadyDeprecated: false };
 }
 
 export async function getCredentialValue(canonicalName: string): Promise<string> {
@@ -525,4 +575,23 @@ function inferCredentialType(vendor: Vendor, purpose: string): string {
   if (/CONFIG_URL/.test(p)) return 'config_url';
   if (/CONFIG_VAL/.test(p)) return 'config_value';
   return 'api_key';
+}
+
+/**
+ * Structured vendor metadata for a row (F5). Prefers the `vendor_metadata` jsonb
+ * column; falls back to the legacy `Vendor metadata: {...}` notes marker — the
+ * FIRST `{...}` run only, so a rotated row's appended text can't corrupt the
+ * parse (the bug that made deprecation delete the wrong key). Returns {} if none.
+ */
+export function readVendorMetadata(
+  row: Pick<CredentialRow, 'vendor_metadata' | 'notes'>,
+): Record<string, unknown> {
+  if (row.vendor_metadata && typeof row.vendor_metadata === 'object') {
+    return row.vendor_metadata as Record<string, unknown>;
+  }
+  const m = (row.notes ?? '').match(/Vendor metadata: (\{[^}]*\})/);
+  if (m) {
+    try { return JSON.parse(m[1]) as Record<string, unknown>; } catch { /* ignore */ }
+  }
+  return {};
 }

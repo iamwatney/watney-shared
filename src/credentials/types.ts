@@ -88,6 +88,13 @@ export interface CredentialRow {
   vendor_api_supports_rotation?: boolean | null;
   vendor_api_supports_create?: boolean | null;
   vendor_api_supports_delete?: boolean | null;
+
+  // F5 (2026-07-21): structured vendor metadata (key ids etc.), replacing the
+  // fragile "Vendor metadata: {...}" free-text-in-notes convention that broke
+  // after the first rotation (two fragments → invalid JSON → wrong-key deletion).
+  vendor_metadata?: Record<string, unknown> | null;
+  /** The PRE-rotation vendor metadata, so deprecation revokes the OLD key, not the new one. */
+  superseded_vendor_metadata?: Record<string, unknown> | null;
 }
 
 /** Audit event written to credential_events for every steward action. */
