@@ -68,6 +68,14 @@ export interface CredentialRow {
 
   // v2 additions
   canonical_name?: string | null;
+  /**
+   * Structured canonical marker (migration 2026-07-21). When true this row is
+   * THE credential to use for its (vendor, purpose[, scope, env]). Replaces the
+   * `[CANONICAL]` free-text convention in `notes` (which is still read as a
+   * fallback during backfill). NULL = not yet adjudicated (resolver treats a
+   * cluster with no canonical as `ambiguous`, never guesses).
+   */
+  is_canonical?: boolean | null;
   /** TS-friendly canonical scope marker. snake_case in DB: scope_v2 not used; we reuse scope. */
   purpose?: string | null;
   env?: string | null;
@@ -199,6 +207,23 @@ export class CanonicalNameError extends Error {
   constructor(public readonly attempted: string, public readonly reason: string) {
     super(`invalid canonical name "${attempted}": ${reason}`);
     this.name = 'CanonicalNameError';
+  }
+}
+
+/**
+ * Thrown when a create/getOrCreate would mint over an SM secret that already
+ * exists but has no registry row (an "orphan"). Minting here would overwrite a
+ * live value + create a duplicate vendor credential — so we fail closed and the
+ * caller must use `registerExistingSecret` (metadata-only) instead.
+ */
+export class OrphanSecretError extends Error {
+  readonly kind = 'orphan-secret' as const;
+  constructor(public readonly smName: string) {
+    super(
+      `refusing to mint over existing SM secret "${smName}" that has no registry row — ` +
+      `register it metadata-only (registerExistingSecret), do not create a new value`,
+    );
+    this.name = 'OrphanSecretError';
   }
 }
 

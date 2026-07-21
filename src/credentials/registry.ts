@@ -19,6 +19,8 @@ export interface CredentialRegistry {
   findByName(name: string): Promise<CredentialRow | null>;
   /** Lookup by canonical key (scope + vendor + purpose + env). */
   findByCanonicalKey(key: CanonicalKey): Promise<CredentialRow | null>;
+  /** All rows for a vendor (case-insensitive). Used by the reuse-first resolver. */
+  listByVendor(vendor: string): Promise<CredentialRow[]>;
   /** Fetch all credentials (paginated up to 1000). */
   listAll(): Promise<CredentialRow[]>;
   /** Insert a brand-new credential row. */
@@ -66,6 +68,14 @@ export function createRegistry(opts: RegistryOpts = {}): CredentialRegistry {
         `/rest/v1/credentials?${filters.join('&')}&select=*&limit=1`,
       )) as CredentialRow[];
       return rows[0] ?? null;
+    },
+
+    async listByVendor(vendor: string): Promise<CredentialRow[]> {
+      // `ilike` with no wildcards = case-insensitive exact match (vendor is stored
+      // lowercase, but callers pass 'GCP'/'gcp' interchangeably).
+      return (await rawSelect(
+        `/rest/v1/credentials?vendor=ilike.${encodeURIComponent(vendor)}&select=*&order=name.asc&limit=200`,
+      )) as CredentialRow[];
     },
 
     async listAll(): Promise<CredentialRow[]> {

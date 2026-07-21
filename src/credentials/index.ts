@@ -24,6 +24,7 @@ import { getVendorAdapter, listSupportedVendors } from './vendors';
 import {
   CanonicalNameError,
   DuplicateCredentialError,
+  OrphanSecretError,
   RateLimitExceededError,
   VendorBlockedError,
   type CanonicalKey,
@@ -34,10 +35,20 @@ import {
   type Scope,
   type Vendor,
 } from './types';
+import {
+  resolveCredential,
+  smLeafOf,
+  type ResolveOpts,
+  type ResolveResult,
+  type ResolveStatus,
+  type CredentialSummary,
+  type CreateRecommendation,
+} from './resolve';
 
 export {
   CanonicalNameError,
   DuplicateCredentialError,
+  OrphanSecretError,
   RateLimitExceededError,
   VendorBlockedError,
   buildCanonicalName,
@@ -49,6 +60,8 @@ export {
   createRegistry,
   getVendorAdapter,
   listSupportedVendors,
+  resolveCredential,
+  smLeafOf,
 };
 export type {
   CanonicalKey,
@@ -60,6 +73,11 @@ export type {
   Vendor,
   SmClient,
   CredentialRegistry,
+  ResolveOpts,
+  ResolveResult,
+  ResolveStatus,
+  CredentialSummary,
+  CreateRecommendation,
 };
 
 const log = createLogger('watney-shared.credentials');
@@ -173,6 +191,27 @@ export async function getOrCreateCredential(opts: GetOrCreateOpts): Promise<GetO
     throw new VendorBlockedError(opts.vendor, 'create', adapter.notes ?? 'create not supported');
   }
 
+  // Step 2.5 (F1 safety — audit finding): fail closed if the SM secret already
+  // exists but has no registry row. `existing` (Step 1) was null → no DB row; if
+  // the SM secret nonetheless exists this is an ORPHAN, and minting would create
+  // a NEW vendor credential AND overwrite the orphan's live value. Orphans must
+  // be registered metadata-only (registerExistingSecret). This runs BEFORE any
+  // vendor mint so we never leak a freshly-minted credential.
+  if (await sm().exists(canonicalName)) {
+    log.warn(
+      { canonicalName, requester: opts.requester },
+      'getOrCreate refused: SM secret exists with no registry row (orphan) — register metadata-only',
+    );
+    await reg.insertEvent({
+      credential_name: canonicalName,
+      event_type: 'review-required',
+      result: 'pending',
+      actor: opts.requester,
+      details: { kind: 'orphan-secret-mint-refused', canonical: canonicalName },
+    });
+    throw new OrphanSecretError(canonicalName);
+  }
+
   // Step 3: rate-limit check
   await checkRateLimit(opts.vendor, 'create');
 
@@ -186,21 +225,16 @@ export async function getOrCreateCredential(opts: GetOrCreateOpts): Promise<GetO
     context: opts.context,
   });
 
-  // Step 5: store in SM
-  let smCreateResult: { resourceName: string; version: number };
-  if (await sm().exists(canonicalName)) {
-    const v = await sm().addVersion(canonicalName, value);
-    smCreateResult = { resourceName: `projects/<project>/secrets/${canonicalName}`, version: v.version };
-  } else {
-    smCreateResult = await sm().create(canonicalName, value, {
-      labels: {
-        scope: opts.scope.toLowerCase(),
-        vendor: opts.vendor.toLowerCase(),
-        purpose: opts.purpose.toLowerCase().replace(/[^a-z0-9_-]/g, ''),
-        created_by: 'credential-steward-v2',
-      },
-    });
-  }
+  // Step 5: store in SM. We proved above the secret does not exist, so this is a
+  // genuine create (create() still tolerates a 409 race defensively).
+  const smCreateResult = await sm().create(canonicalName, value, {
+    labels: {
+      scope: opts.scope.toLowerCase(),
+      vendor: opts.vendor.toLowerCase(),
+      purpose: opts.purpose.toLowerCase().replace(/[^a-z0-9_-]/g, ''),
+      created_by: 'credential-steward-v2',
+    },
+  });
 
   // Step 6: insert DB row
   const inserted = await reg.insert({
@@ -393,6 +427,86 @@ export async function healthCheckCredential(canonicalName: string): Promise<Heal
   } catch (err) {
     return { healthy: false, lastChecked: new Date(), failureReason: (err as Error).message };
   }
+}
+
+export interface RegisterExistingOpts {
+  /** The exact SM secret name (leaf) that already exists. */
+  name: string;
+  requester: string;
+  context?: string;
+}
+
+/**
+ * Register an SM secret that ALREADY EXISTS as a registry row — metadata only.
+ *
+ * NEVER mints, rotates, or writes the SM value. This is the safe handler for
+ * "SM orphan with a conforming name" drift (audit F1): it records a row
+ * referencing the existing value and flags `needs_review` so a human confirms
+ * the inferred vendor/purpose. Idempotent: if a row already exists for the
+ * name, returns it unchanged.
+ */
+export async function registerExistingSecret(
+  opts: RegisterExistingOpts,
+): Promise<GetOrCreateResult & { registered: boolean }> {
+  const reg = registry();
+  const name = opts.name;
+
+  // Idempotency — already registered?
+  const existing = await reg.findByName(name);
+  if (existing) {
+    const version = await sm().latestVersion(existing.name).catch(() => 0);
+    return {
+      smName: existing.name, smVersion: version, created: false, registered: false,
+      canonicalName: existing.canonical_name ?? existing.name, dbId: existing.id,
+    };
+  }
+
+  // Must actually exist in SM (read-only). If not, this is not an orphan.
+  if (!(await sm().exists(name))) {
+    throw new ConfigError(name, 'registerExistingSecret: SM secret does not exist — nothing to register');
+  }
+  const smVersion = await sm().latestVersion(name).catch(() => 0);
+
+  const parsed = parseCanonicalName(name);
+  const scopeSeg = parsed?.scope ?? null;
+  const adapter = parsed ? getVendorAdapter(parsed.vendor) : null;
+
+  // NB: `is_canonical` intentionally omitted → DB default (null) → the resolver
+  // treats an un-adjudicated cluster as `ambiguous`. Keeps this decoupled from
+  // migration ordering (insert never references the new column).
+  const inserted = await reg.insert({
+    name,
+    canonical_name: name,
+    vendor: parsed?.vendor.toLowerCase() ?? 'unknown',
+    credential_type: parsed ? inferCredentialType(parsed.vendor, parsed.purpose) : 'api_key',
+    scope: scopeSeg === 'WATNEY' || scopeSeg === 'EDGE_AI' ? 'account-wide' : 'project-scoped',
+    scope_target: scopeSeg === 'WATNEY' || scopeSeg === 'EDGE_AI' ? null : scopeSeg,
+    source_of_truth: 'gcp-secret-manager',
+    source_location: `${process.env.GCP_PROJECT ?? 'watney-workflows'}/${name}`,
+    description: `Registered metadata-only from SM orphan at ${new Date().toISOString()} by ${opts.requester}${opts.context ? ` — ${opts.context}` : ''}. Value NOT minted; references the existing secret.`,
+    owner: 'paul',
+    confidence: 'LOW',
+    needs_review: true,
+    created_by: opts.requester,
+    purpose: parsed?.purpose ?? null,
+    env: parsed?.env ?? null,
+    rollback_days: 7,
+    vendor_api_supports_create: adapter?.createSupported ?? null,
+    vendor_api_supports_rotation: adapter?.rotateSupported ?? null,
+    vendor_api_supports_delete: adapter?.deleteSupported ?? null,
+  });
+
+  await reg.insertEvent({
+    credential_id: inserted.id,
+    credential_name: name,
+    event_type: 'created',
+    result: 'succeeded',
+    actor: opts.requester,
+    details: { kind: 'register-orphan-metadata-only', canonical: name, sm_version: smVersion, note: 'metadata only — value not minted' },
+  });
+
+  log.info({ name, dbId: inserted.id }, 'registered SM orphan (metadata-only)');
+  return { smName: name, smVersion, created: false, registered: true, canonicalName: name, dbId: inserted.id };
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
