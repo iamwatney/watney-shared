@@ -20,29 +20,76 @@
  */
 import type { SupabaseClient } from '@supabase/supabase-js';
 
-// USD per million tokens — Anthropic published prices. Update if prices move.
-// Single source of truth across the estate — previously duplicated 3 ways.
+// USD per million tokens — Anthropic first-party published prices
+// (platform.claude.com/docs/en/about-claude/pricing, checked 2026-10-12).
+// Update if prices move. Single source of truth across the estate.
+// Base input/output only: cache writes/reads, batch and inference_geo
+// multipliers are not modelled.
 const USD_TO_GBP = 0.79;
 
-interface ModelPrice { inputUsdPerMTok: number; outputUsdPerMTok: number }
+interface ModelPrice {
+  inputUsdPerMTok: number;
+  outputUsdPerMTok: number;
+  /** Prompt-length tier: requests with more input tokens than this pay the long-prompt price. */
+  longPrompt?: { overInputTokens: number; inputUsdPerMTok: number; outputUsdPerMTok: number };
+}
 
 export const MODEL_PRICES: Record<string, ModelPrice> = {
+  // Fable 5.1 / 5 (Mythos counterparts priced the same)
+  'claude-fable-5-1':           { inputUsdPerMTok: 10,   outputUsdPerMTok: 50 },
+  'claude-fable-5':             { inputUsdPerMTok: 10,   outputUsdPerMTok: 50 },
+  'claude-mythos-5-1':          { inputUsdPerMTok: 10,   outputUsdPerMTok: 50 },
+  'claude-mythos-5':            { inputUsdPerMTok: 10,   outputUsdPerMTok: 50 },
+  // Opus 5.5
+  'claude-opus-5-5':            { inputUsdPerMTok:  4,   outputUsdPerMTok: 20 },
+  // Opus 5 / 4.8 / 4.7 / 4.6 / 4.5
+  'claude-opus-5':              { inputUsdPerMTok:  5,   outputUsdPerMTok: 25 },
+  'claude-opus-4-8':            { inputUsdPerMTok:  5,   outputUsdPerMTok: 25 },
+  'claude-opus-4-7':            { inputUsdPerMTok:  5,   outputUsdPerMTok: 25 },
+  'claude-opus-4-6':            { inputUsdPerMTok:  5,   outputUsdPerMTok: 25 },
+  'claude-opus-4-5':            { inputUsdPerMTok:  5,   outputUsdPerMTok: 25 },
+  // Opus 4 / 4.1 (retired on the first-party API; genuinely $15/$75)
+  'claude-opus-4-1':            { inputUsdPerMTok: 15,   outputUsdPerMTok: 75 },
+  'claude-opus-4':              { inputUsdPerMTok: 15,   outputUsdPerMTok: 75 },
+  // Sonnet 5.5 / 5
+  'claude-sonnet-5-5':          { inputUsdPerMTok:  2,   outputUsdPerMTok: 10 },
+  'claude-sonnet-5':            { inputUsdPerMTok:  2,   outputUsdPerMTok: 10 },
+  // Sonnet 4.6 / 4.5
+  'claude-sonnet-4-6':          { inputUsdPerMTok:  3,   outputUsdPerMTok: 15 },
+  'claude-sonnet-4-6-20251001': { inputUsdPerMTok:  3,   outputUsdPerMTok: 15 },
+  'claude-sonnet-4-5':          { inputUsdPerMTok:  3,   outputUsdPerMTok: 15 },
+  // Haiku 5.5 — priced by prompt length (over 100K input tokens costs more)
+  'claude-haiku-5-5':           { inputUsdPerMTok:  0.1, outputUsdPerMTok:  0.5,
+                                  longPrompt: { overInputTokens: 100_000, inputUsdPerMTok: 0.5, outputUsdPerMTok: 2.5 } },
   // Haiku 4.5
-  'claude-haiku-4-5-20251001':  { inputUsdPerMTok:  1, outputUsdPerMTok:  5 },
-  'claude-haiku-4-5':           { inputUsdPerMTok:  1, outputUsdPerMTok:  5 },
-  // Sonnet 4.6
-  'claude-sonnet-4-6':          { inputUsdPerMTok:  3, outputUsdPerMTok: 15 },
-  'claude-sonnet-4-6-20251001': { inputUsdPerMTok:  3, outputUsdPerMTok: 15 },
-  // Opus 4 / 4.6 / 4.7
-  'claude-opus-4':              { inputUsdPerMTok: 15, outputUsdPerMTok: 75 },
-  'claude-opus-4-6':            { inputUsdPerMTok: 15, outputUsdPerMTok: 75 },
-  'claude-opus-4-7':            { inputUsdPerMTok: 15, outputUsdPerMTok: 75 },
+  'claude-haiku-4-5-20251001':  { inputUsdPerMTok:  1,   outputUsdPerMTok:  5 },
+  'claude-haiku-4-5':           { inputUsdPerMTok:  1,   outputUsdPerMTok:  5 },
 };
 
+const FALLBACK_MODEL = 'claude-sonnet-4-6';
+const warnedUnknownModels = new Set<string>();
+
+/** Exact id first, then the id with a trailing -YYYYMMDD snapshot date removed. */
+function lookupPrice(model: string): ModelPrice | undefined {
+  return MODEL_PRICES[model] ?? MODEL_PRICES[model.replace(/-\d{8}$/, '')];
+}
+
 export function estimateCostGbp(model: string, inTok: number, outTok: number): number {
-  const price = MODEL_PRICES[model] || MODEL_PRICES['claude-sonnet-4-6'];
-  const inputUsd  = (inTok  / 1_000_000) * price.inputUsdPerMTok;
-  const outputUsd = (outTok / 1_000_000) * price.outputUsdPerMTok;
+  let price = lookupPrice(model);
+  if (!price) {
+    // Still return a number (logLlmUsage writes it straight to
+    // cost_gbp_estimate), but say so once per model — the old silent
+    // Sonnet 4.6 fallback hid wrong costs for every newer model.
+    if (!warnedUnknownModels.has(model)) {
+      warnedUnknownModels.add(model);
+      // eslint-disable-next-line no-console
+      console.warn(`[llmUsageLogger] no price for model "${model}" — cost estimated at ${FALLBACK_MODEL} rates; add it to MODEL_PRICES in @watney/shared`);
+    }
+    price = MODEL_PRICES[FALLBACK_MODEL];
+  }
+  const tier = price.longPrompt && inTok > price.longPrompt.overInputTokens ? price.longPrompt : price;
+  const inputUsd  = (inTok  / 1_000_000) * tier.inputUsdPerMTok;
+  const outputUsd = (outTok / 1_000_000) * tier.outputUsdPerMTok;
   return (inputUsd + outputUsd) * USD_TO_GBP;
 }
 
